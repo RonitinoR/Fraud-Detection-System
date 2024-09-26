@@ -163,3 +163,6 @@ cython_debug/
 
 # Zip file
 *.zip
+
+# CSV file
+transaction_data/creditcard.csv
