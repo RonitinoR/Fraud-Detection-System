@@ -7,6 +7,12 @@ from modeling import FraudDetection
 from sklearn.metrics import classification_report
 
 file_path = "transaction_data/creditcard.csv"
+temp_dir = "/tmp/airflow_fraud_detection/"
+
+#fucntion to create temporary directory if it doesn't exist
+def create_temp_dir():
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
 
 #defining the functions to be used in the DAG
 def check_file_path(file_path: str):
@@ -24,31 +30,40 @@ def create_fraud_detector(**kwargs):
     #save the preprocessed to a temporary file for reuse
     X, y = fraud_detector.load_data()
     X_scaled = fraud_detector.preprocess(X)
-    np.savez('/tmp/preprocessed_data.npz', X_scaled = X_scaled, y = y) 
+    np.savez(os.path.join(temp_dir,'preprocessed_data.npz'), X_scaled = X_scaled, y = y) 
 
 def undersampling_data(**kwargs):
     fraud_detector = FraudDetection(file_path)
-    #load the preprocessed data from the saved temporary file
-    data = np.load('tmp/preprocessed_data.npz')
-    X_scaled, y = data['X_sacled'], data['y']
+    try:
+        #load the preprocessed data from the saved temporary file
+        data = np.load(os.path.join(temp_dir,'preprocessed_data.npz'))
+        X_scaled, y = data['X_scaled'], data['y']
+    except FileNotFoundError:
+        raise FileNotFoundError("preprocessed data file not found.")
     X_res, y_res = fraud_detector.undersampling(X_scaled, y)
     #save undersampled data to a temporary file
-    np.savez('/tmp/undersampled_data.npz', X_res = X_res, y_res = y_res)
+    np.savez(os.path.join(temp_dir,'undersampled_data.npz'), X_res = X_res, y_res = y_res)
 
 def split_data(**kwargs):
     fraud_detector = FraudDetection(file_path)
-    #load the undersampled data
-    data = np.load('/tmp/undersampled_data.npz')
-    X_res, y_res = data['X_res'], data['y_res']
+    try:
+        #load the undersampled data
+        data = np.load(os.path.join(temp_dir,'undersampled_data.npz'))
+        X_res, y_res = data['X_res'], data['y_res']
+    except FileNotFoundError:
+        raise FileNotFoundError("undersampling data file not found.")
     X_train, X_test, y_train, y_test = fraud_detector.traintest_split(X_res, y_res)
     #save the split data to the temporary file
-    np.savez('/tmp/split_data.npz', X_train = X_train, X_test = X_test, y_train = y_train, y_test = y_test)
+    np.savez(os.path.join(temp_dir, 'split_data.npz'), X_train = X_train, X_test = X_test, y_train = y_train, y_test = y_test)
 
 def isolation_forest(**kwargs):
     fraud_detector = FraudDetection(file_path)
-    #load the split data
-    data = np.load('/tmp/split_data.npz')
-    X_train, X_test, y_train, y_test = data['X_train'], data['X_test'], data['y_train'], data['y_test']
+    try:
+        #load the split data
+        data = np.load(os.path.join(temp_dir,'split_data.npz'))
+        X_train, X_test, y_train, y_test = data['X_train'], data['X_test'], data['y_train'], data['y_test']
+    except FileNotFoundError:
+        raise FileNotFoundError("Split data file is not found.")
     isolation = fraud_detector.isolationForest(X_train)
     y_pred = fraud_detector.predict(isolation, X_test)
     auc = fraud_detector.evaluate(y_test, y_pred)
@@ -58,9 +73,12 @@ def isolation_forest(**kwargs):
 
 def train_autoencoder(**kwargs):
     fraud_detector = FraudDetection(file_path)
-    #load the split data again in here
-    data = np.load('/tmp/split_data.npz')
-    X_train, X_test, y_train, y_test = data['X_train'], data['X_test'], data['y_train'], data['y_test']
+    try:
+        #load the split data again in here
+        data = np.load(os.path.join(temp_dir,'split_data.npz'))
+        X_train, X_test, y_train, y_test = data['X_train'], data['X_test'], data['y_train'], data['y_test']
+    except FileNotFoundError:
+        raise FileNotFoundError("Split data file is not found.")
     autoencoder = fraud_detector.train_encoder(X_train)
     threshold = fraud_detector.threshold_selection(autoencoder, X_test, y_test)
     print(f"selected balanced threshold with better recall rate: {threshold:.4f}")
@@ -70,13 +88,23 @@ def train_autoencoder(**kwargs):
     print("\nAutoencoder classification report: ")
     print(classification_report(y_test, y_pred_ae))
 
-
+def cleanup_temp_files():
+    if not os.path.exists(temp_dir):
+        for file in os.listdir(temp_dir):
+            file_path = os.path.join(temp_dir, file)
+            os.remove(file_path)
+        os.rmdir(temp_dir)
+        print(f"Cleaned up temporary files in {temp_dir}")
 default_args = {
     'start_date': datetime(2024, 1, 1),
     'retries': 1,
 }
 
 with DAG('fraud_detection_pipeline', default_args = default_args, schedule_interval= '@daily', catchup = False) as dag:
+    create_temp_dir_task = PythonOperator(
+        task_id = 'create_temp_dir',
+        python_callable = create_temp_dir
+    )
     check_file_task = PythonOperator(
         task_id = 'check_file_path',
         python_callable = check_file_path,
@@ -107,6 +135,9 @@ with DAG('fraud_detection_pipeline', default_args = default_args, schedule_inter
         task_id = 'train_autoencoder',
         python_callable = train_autoencoder
     )
-
+    cleanup_task = PythonOperator(
+        task_id = 'cleanup_temp_files',
+        python_callable = cleanup_temp_files
+    )
     #Defining the task dependencies
-    check_file_task >> create_fraud_detector_task >> undersample_task >> split_data_task >> isolation_forest_task >> train_autoencoder_task
+    create_temp_dir_task >> check_file_task >> create_fraud_detector_task >> undersample_task >> split_data_task >> isolation_forest_task >> train_autoencoder_task >> cleanup_task
