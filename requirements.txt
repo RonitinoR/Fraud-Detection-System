@@ -8,3 +8,6 @@ matplotlib
 seaborn
 airflow
 plotly
+fastapi
+uvicorn
+cachetools
